@@ -64,10 +64,10 @@ def remove_background_ai(image_array):
         
         result_array = np.array(result)
         
-        if result_array.shape[2] == 4:
-            alpha = result_array[:, :, 3]
-            smoothed_alpha = smooth_alpha_channel(alpha, blur_radius=1.5)
-            result_array[:, :, 3] = smoothed_alpha
+        # if result_array.shape[2] == 4:
+        #     alpha = result_array[:, :, 3]
+        #     smoothed_alpha = smooth_alpha_channel(alpha, blur_radius=0)
+        #     result_array[:, :, 3] = smoothed_alpha
         
         return result_array, True
     except Exception as e:
