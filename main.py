@@ -160,9 +160,21 @@ def process_image(input_path, output_path):
                 result_image = remove_background_color_based_enhanced(image_rgb, bg_color)
                 method_used = f"Enhanced color-based removal ({bg_color} background)"
         
+        # Add 40px margin to the top
         pil_image = Image.fromarray(result_image, 'RGBA')
         
-        pil_image.save(output_path, 'PNG', optimize=False, compress_level=1)
+        # Get original dimensions
+        original_width, original_height = pil_image.size
+        
+        # Create new image with 40px extra height at top
+        top_margin = 10
+        new_height = original_height + top_margin
+        new_image = Image.new('RGBA', (original_width, new_height), (0, 0, 0, 0))
+        
+        # Paste the original image with 40px offset from top
+        new_image.paste(pil_image, (0, top_margin))
+        
+        new_image.save(output_path, 'PNG', optimize=False, compress_level=1)
         
         return True, method_used
         
