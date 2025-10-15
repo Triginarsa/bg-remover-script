@@ -1,28 +1,41 @@
-# Background Remover Script
+# Background Remover & Image Upscaler
 
-This Python script automatically removes white or black backgrounds from images and converts them to transparent PNG files.
+Automatically remove backgrounds from images and intelligently upscale them to high quality.
+
+## Features
+
+- 🎨 **Background Removal** - Uses rembg for clean, natural edges
+- ⬆️ **Smart Image Upscaling** - Real-ESRGAN upscaling for non-pixelated results
+- 📏 **Auto Margin** - Adds 10px top margin to all processed images
+- 🚀 **Batch Processing** - Process multiple images at once
 
 ## Requirements
 
 - Python 3.12+
+- macOS, Linux, or Windows
 
 ## Installation
 
-Install dependencies using a virtual environment and the provided `requirements.txt`:
+1. **Clone or download this repository**
 
-```bash
-# from the project root
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+2. **Create and activate virtual environment**:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   ```
+
+3. **Install dependencies**:
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
 
 ## Usage
 
 1. **Place your images** in the `input/` folder
 
-   - Supported formats: JPG, JPEG, PNG, BMP, TIFF, WEBP
+   - Supported formats: JPG, JPEG, PNG, BMP, TIFF
 
 2. **Run the script**:
 
@@ -30,34 +43,31 @@ pip install -r requirements.txt
    python main.py
    ```
 
-3. **Check results**:
-   - Processed images will be saved in the `output/` folder as PNG files
-   - A detailed report will be generated in `output.txt`
+3. **Find your processed images** in the `output/` folder
+   - All images saved as PNG with transparent backgrounds
+   - Original filenames preserved
+   - Processing report saved to `output.txt`
 
-## How it Works
+## How It Works
 
-1. **Background Detection**:
+1. **Background Detection** - Automatically detects white, black, or other backgrounds
+2. **AI Removal** - Uses rembg model for clean background removal
+3. **Add Margin** - Adds 10px margin at the top
+4. **Smart Upscale** - Upscales images smaller than 800px (max 1000px) using Real-ESRGAN
+5. **Save PNG** - Outputs transparent PNG files
 
-   - Samples pixels from image edges (corners and midpoints)
-   - Determines if background is predominantly white, black, or other
-   - Uses a tolerance of 30 RGB values for color detection
+## Upscaling Behavior
 
-2. **Background Removal**:
+Images are upscaled conservatively to maintain natural photo quality:
 
-   - For white backgrounds: Makes white pixels transparent
-   - For black backgrounds: Makes black pixels transparent
-   - Uses tolerance to handle slight color variations
+- **< 400px**: Upscaled 2x
+- **400-600px**: Upscaled 1.5x
+- **600-800px**: Minimal upscale to ~850px
+- **≥ 800px**: No upscaling (already good size)
 
-3. **File Processing**:
-   - Keeps original filename but changes extension to `.png`
-   - Skips files with backgrounds that aren't white or black
-   - Handles errors gracefully and reports them
+## Notes
 
-## Output
-
-- **Processed Images**: Saved in `output/` folder with transparent backgrounds
-- **Results Report**: `output.txt` contains:
-  - Processing summary (total processed, skipped, errors)
-  - Detailed file-by-file results
-  - Background color detection results
-  - Processing timestamp
+- The first run will download AI models (may take a moment)
+- Larger images take longer to process
+- All output files are saved as PNG for transparency support
+- Original images in `input/` are never modified

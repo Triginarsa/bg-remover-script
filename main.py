@@ -6,6 +6,10 @@ from datetime import datetime
 from rembg import remove
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter
+from tqdm import tqdm
+import time
+import sys
+from io import StringIO
 
 # Fix basicsr compatibility with newer torchvision
 import fix_basicsr
@@ -21,7 +25,6 @@ def get_upscaler():
     global _upscaler
     if _upscaler is None:
         try:
-            print("  Loading Real-ESRGAN model (first time only)...")
             from basicsr.archs.rrdbnet_arch import RRDBNet
             from realesrgan import RealESRGANer
             
@@ -36,7 +39,6 @@ def get_upscaler():
                 half=False  # Set to True if you have GPU for faster processing
             )
         except Exception as e:
-            print(f"  Warning: Could not load Real-ESRGAN ({str(e)})")
             _upscaler = False  # Mark as failed
     return _upscaler if _upscaler is not False else None
 
@@ -56,29 +58,16 @@ def intelligent_upscale(image_array, max_dimension=1000):
     current_max = max(height, width)
     
     # Only upscale if image is significantly smaller than target
-    # Leave a buffer zone to avoid unnecessary upscaling
     if current_max >= 800:
-        print(f"  Image size good ({width}x{height}), skipping upscale for natural look")
         return image_array
     
-    # Calculate how much we need to scale
-    scale_needed = max_dimension / current_max
-    
-    # For human photos, be very conservative
-    # Only use minimal upscaling to reach around 800-900px range
+    # Calculate scale factor
     if current_max < 400:
-        # Very small image - upscale 2x
         scale_factor = 2
-        print(f"  Small image detected. Upscaling {width}x{height} -> 2x with Real-ESRGAN...")
     elif current_max < 600:
-        # Medium-small image - upscale 1.5x for natural look
         scale_factor = 1.5
-        print(f"  Upscaling {width}x{height} -> 1.5x with Real-ESRGAN for natural look...")
     else:
-        # Already decent size (600-800px) - minimal upscale
-        # Calculate just enough to reach ~850px
         scale_factor = min(850 / current_max, 1.5)
-        print(f"  Light upscale {width}x{height} -> {scale_factor:.1f}x to maintain natural photo quality...")
     
     # Separate alpha channel if present
     has_alpha = image_array.shape[2] == 4 if len(image_array.shape) == 3 else False
@@ -93,17 +82,24 @@ def intelligent_upscale(image_array, max_dimension=1000):
     # Convert RGB to BGR for Real-ESRGAN
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     
-    # Upscale with Real-ESRGAN
+    # Upscale with Real-ESRGAN (suppress tile output)
     try:
         upscaler = get_upscaler()
         if upscaler is None:
-            print(f"  Real-ESRGAN not available, skipping upscale")
             return image_array
-            
-        upscaled_bgr, _ = upscaler.enhance(bgr, outscale=scale_factor)
+        
+        # Redirect stdout to suppress tile messages
+        old_stdout = sys.stdout
+        sys.stdout = StringIO()
+        
+        try:
+            upscaled_bgr, _ = upscaler.enhance(bgr, outscale=scale_factor)
+        finally:
+            sys.stdout = old_stdout
+        
         upscaled_rgb = cv2.cvtColor(upscaled_bgr, cv2.COLOR_BGR2RGB)
         
-        # Upscale alpha channel if present (use high-quality interpolation)
+        # Upscale alpha channel if present
         if has_alpha:
             new_height, new_width = upscaled_rgb.shape[:2]
             upscaled_alpha = cv2.resize(alpha, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
@@ -111,14 +107,9 @@ def intelligent_upscale(image_array, max_dimension=1000):
         else:
             result = upscaled_rgb
         
-        final_height, final_width = result.shape[:2]
-        final_max = max(final_width, final_height)
-        print(f"  ✓ Upscaled to {final_width}x{final_height} (max: {final_max}px) - natural photo quality preserved")
-        
         return result
         
     except Exception as e:
-        print(f"  Warning: Upscaling failed ({str(e)}), using original image")
         return image_array
 
 def detect_background_color(image_array):
@@ -238,70 +229,94 @@ def remove_background_color_based_enhanced(image_array, bg_color):
     
     return rgba_image
 
-def process_image(input_path, output_path):
+def process_image(input_path, output_path, pbar=None):
     """
     Process a single image to remove background and save as PNG.
     Returns True if successful, False otherwise.
     """
+    steps = []
     try:
+        # Step 1: Read image
+        if pbar:
+            pbar.set_description("📖 Reading image")
         image = cv2.imread(input_path)
         if image is None:
-            return False, "Could not read image"
+            return False, "Could not read image", []
         
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Detect bg color
+        # Step 2: Detect background
+        if pbar:
+            pbar.set_description("🔍 Detecting background")
         bg_color = detect_background_color(image_rgb)
+        steps.append(f"✓ Background: {bg_color}")
+        
+        # Step 3: Remove background
+        if pbar:
+            pbar.set_description("🎨 Removing background")
         
         if bg_color == 'other':
-            # try to remove bg even if not white/black
-            print(f"  Background color not white/black, trying AI removal...")
             ai_result, ai_success = remove_background_ai(image_rgb)
             if ai_success:
                 result_image = ai_result
-                method_used = "AI-based removal (background color: other)"
+                method_used = "AI removal"
+                steps.append("✓ AI removal successful")
             else:
-                return False, f"Background is not white or black and AI removal failed"
+                return False, f"Background removal failed", steps
         else:
-            print(f"  Detected {bg_color} background, trying AI removal...")
             ai_result, ai_success = remove_background_ai(image_rgb)
             
             if ai_success:
                 result_image = ai_result
-                method_used = f"AI-based removal (detected {bg_color} background)"
+                method_used = "AI removal"
+                steps.append("✓ AI removal successful")
             else:
-                print(f"  Using enhanced color-based removal...")
                 result_image = remove_background_color_based_enhanced(image_rgb, bg_color)
-                method_used = f"Enhanced color-based removal ({bg_color} background)"
+                method_used = "Color-based removal"
+                steps.append("✓ Color-based removal")
         
-        # Add 40px margin to the top first
+        # Step 4: Add margin
+        if pbar:
+            pbar.set_description("📏 Adding margin")
         pil_image = Image.fromarray(result_image)
-        
-        # Get original dimensions
         original_width, original_height = pil_image.size
         
-        # Create new image with 40px extra height at top
         top_margin = 10
         new_height = original_height + top_margin
         new_image = Image.new('RGBA', (original_width, new_height), (0, 0, 0, 0))
-        
-        # Paste the original image with 40px offset from top (using alpha channel as mask)
         new_image.paste(pil_image, (0, top_margin), pil_image)
+        steps.append(f"✓ Margin added ({top_margin}px)")
         
-        # Convert back to array for upscaling
+        # Step 5: Upscale if needed
+        if pbar:
+            pbar.set_description("⬆️  Checking upscale")
         final_image_array = np.array(new_image)
+        height, width = final_image_array.shape[:2]
+        current_max = max(height, width)
         
-        # Upscale image intelligently if needed (after adding margin)
-        final_image_array = intelligent_upscale(final_image_array, max_dimension=1000)
+        if current_max < 800:
+            if pbar:
+                pbar.set_description("⬆️  Upscaling image")
+            final_image_array = intelligent_upscale(final_image_array, max_dimension=1000)
+            final_height, final_width = final_image_array.shape[:2]
+            steps.append(f"✓ Upscaled to {final_width}x{final_height}px")
+        else:
+            steps.append(f"✓ Size good ({width}x{height}px)")
         
-        # Convert back to PIL and save
+        # Step 6: Save
+        if pbar:
+            pbar.set_description("💾 Saving image")
         final_pil_image = Image.fromarray(final_image_array)
         final_pil_image.save(output_path, 'PNG', optimize=False, compress_level=1)
         
-        return True, method_used
+        if pbar:
+            pbar.set_description("✅ Complete")
+        
+        return True, method_used, steps
         
     except Exception as e:
-        return False, f"Error processing image: {str(e)}"
+        steps.append(f"✗ Error: {str(e)}")
+        return False, f"Error: {str(e)}", steps
 
 def main():
     """
@@ -314,71 +329,115 @@ def main():
     
     supported_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
     
+    # Print header
+    print("\n" + "="*70)
+    print("🎨  BACKGROUND REMOVER & IMAGE UPSCALER".center(70))
+    print("="*70)
+    
+    if not os.path.exists(input_folder):
+        print(f"\n❌ Error: Input folder '{input_folder}' does not exist!")
+        return
+    
+    # Get list of files to process
+    all_files = os.listdir(input_folder)
+    files_to_process = []
+    
+    for filename in all_files:
+        if filename.startswith('.'):
+            continue
+        file_extension = os.path.splitext(filename)[1].lower()
+        if file_extension in supported_extensions:
+            files_to_process.append(filename)
+    
+    if not files_to_process:
+        print(f"\n❌ No supported images found in '{input_folder}' folder!")
+        return
+    
+    total_files = len(files_to_process)
+    print(f"\n🔢 Found {total_files} image(s) to process")
+    print("="*70 + "\n")
+    
     results = []
     processed_count = 0
     skipped_count = 0
+    start_time = time.time()
+    processing_times = []
     
-    print("Starting Enhanced Background Removal Process...")
-    print("Using AI-based removal with fallback to enhanced color-based method")
-    print(f"Input folder: {input_folder}")
-    print(f"Output folder: {output_folder}")
-    print("-" * 60)
-    
-    if not os.path.exists(input_folder):
-        print(f"Error: Input folder '{input_folder}' does not exist!")
-        return
-    
-    files = os.listdir(input_folder)
-    if not files:
-        print(f"No files found in '{input_folder}' folder!")
-        return
-    
-    for filename in files:
-        if filename.startswith('.'):
-            continue
-            
-        file_extension = os.path.splitext(filename)[1].lower()
-        if file_extension not in supported_extensions:
-            continue
-        
+    # Process each file with progress bar
+    for idx, filename in enumerate(files_to_process, 1):
         input_path = os.path.join(input_folder, filename)
-        
         base_name = os.path.splitext(filename)[0]
         output_filename = base_name + '.png'
         output_path = os.path.join(output_folder, output_filename)
         
-        print(f"Processing: {filename}")
+        # Calculate overall ETA
+        if processing_times:
+            avg_time = sum(processing_times) / len(processing_times)
+            remaining_files = total_files - idx + 1
+            eta_seconds = avg_time * remaining_files
+            eta_min = int(eta_seconds // 60)
+            eta_sec = int(eta_seconds % 60)
+            eta_str = f"{eta_min}m {eta_sec}s" if eta_min > 0 else f"{eta_sec}s"
+            print(f"\n[{idx}/{total_files}] 📸 {filename} | ⏱️  Overall ETA: {eta_str}")
+        else:
+            print(f"\n[{idx}/{total_files}] 📸 {filename}")
         
-        success, message = process_image(input_path, output_path)
+        print("-" * 70)
+        
+        with tqdm(total=100, bar_format='{l_bar}{bar}| {elapsed} < {remaining}', 
+                  ncols=70, colour='green') as pbar:
+            
+            file_start_time = time.time()
+            success, method, steps = process_image(input_path, output_path, pbar)
+            file_end_time = time.time()
+            processing_time = file_end_time - file_start_time
+            processing_times.append(processing_time)
+            
+            pbar.update(100)
+        
+        # Print processing steps
+        for step in steps:
+            print(f"  {step}")
         
         if success:
             processed_count += 1
-            print(f"  ✓ {message}")
-            results.append(f"✓ {filename} -> {output_filename}: {message}")
+            print(f"  ⏱️  Time: {processing_time:.2f}s | Method: {method}")
+            print(f"  ✅ SUCCESS")
+            results.append(f"✓ {filename} -> {output_filename}: {method}")
         else:
             skipped_count += 1
-            print(f"  ✗ Skipped: {message}")
-            results.append(f"✗ {filename}: {message}")
-        
-        print()
+            print(f"  ❌ FAILED: {method}")
+            results.append(f"✗ {filename}: {method}")
     
+    # Summary
+    total_time = time.time() - start_time
+    avg_time = total_time / total_files if total_files > 0 else 0
+    
+    print("\n" + "="*70)
+    print("📊 SUMMARY".center(70))
+    print("="*70)
+    print(f"✅ Processed:  {processed_count}/{total_files}")
+    print(f"❌ Failed:     {skipped_count}/{total_files}")
+    print(f"⏱️  Total time: {total_time:.2f}s")
+    print(f"⚡ Avg/image:  {avg_time:.2f}s")
+    print("="*70)
+    
+    # Save results to file
     with open('output.txt', 'w') as f:
-        f.write("Enhanced Background Removal Results\n")
-        f.write("=" * 40 + "\n")
-        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write(f"Total files processed: {processed_count}\n")
-        f.write(f"Total files skipped: {skipped_count}\n\n")
+        f.write("="*70 + "\n")
+        f.write("BACKGROUND REMOVAL & UPSCALE RESULTS\n")
+        f.write("="*70 + "\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Total processed: {processed_count}\n")
+        f.write(f"Total failed:    {skipped_count}\n")
+        f.write(f"Total time:      {total_time:.2f}s\n")
+        f.write(f"Average time:    {avg_time:.2f}s per image\n\n")
         f.write("Detailed Results:\n")
-        f.write("-" * 30 + "\n")
-        
+        f.write("-"*70 + "\n")
         for result in results:
             f.write(result + "\n")
     
-    print("-" * 60)
-    print(f"Enhanced background removal completed!")
-    print(f"Successfully processed: {processed_count} images")
-    print(f"Skipped: {skipped_count} images")
-    print(f"Results saved to: output.txt")
+    print(f"\n💾 Results saved to: output.txt\n")
 
 if __name__ == "__main__":
     main()
