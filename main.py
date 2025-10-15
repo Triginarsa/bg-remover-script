@@ -7,6 +7,120 @@ from rembg import remove
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter
 
+# Fix basicsr compatibility with newer torchvision
+import fix_basicsr
+
+# Initialize Real-ESRGAN upscaler (lazy loading)
+_upscaler = None
+
+def get_upscaler():
+    """
+    Lazy load the Real-ESRGAN upscaler.
+    Uses RealESRGAN_x2plus model for conservative, high-quality upscaling.
+    """
+    global _upscaler
+    if _upscaler is None:
+        try:
+            print("  Loading Real-ESRGAN model (first time only)...")
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            from realesrgan import RealESRGANer
+            
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+            _upscaler = RealESRGANer(
+                scale=2,
+                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                model=model,
+                tile=400,
+                tile_pad=10,
+                pre_pad=0,
+                half=False  # Set to True if you have GPU for faster processing
+            )
+        except Exception as e:
+            print(f"  Warning: Could not load Real-ESRGAN ({str(e)})")
+            _upscaler = False  # Mark as failed
+    return _upscaler if _upscaler is not False else None
+
+def intelligent_upscale(image_array, max_dimension=1000):
+    """
+    Intelligently upscale image for human photos with natural-looking results.
+    Very conservative - only upscales small images and stops at reasonable size.
+    
+    Args:
+        image_array: Input image as numpy array (RGB or RGBA)
+        max_dimension: Target maximum dimension (default 1000px)
+    
+    Returns:
+        Upscaled image array
+    """
+    height, width = image_array.shape[:2]
+    current_max = max(height, width)
+    
+    # Only upscale if image is significantly smaller than target
+    # Leave a buffer zone to avoid unnecessary upscaling
+    if current_max >= 800:
+        print(f"  Image size good ({width}x{height}), skipping upscale for natural look")
+        return image_array
+    
+    # Calculate how much we need to scale
+    scale_needed = max_dimension / current_max
+    
+    # For human photos, be very conservative
+    # Only use minimal upscaling to reach around 800-900px range
+    if current_max < 400:
+        # Very small image - upscale 2x
+        scale_factor = 2
+        print(f"  Small image detected. Upscaling {width}x{height} -> 2x with Real-ESRGAN...")
+    elif current_max < 600:
+        # Medium-small image - upscale 1.5x for natural look
+        scale_factor = 1.5
+        print(f"  Upscaling {width}x{height} -> 1.5x with Real-ESRGAN for natural look...")
+    else:
+        # Already decent size (600-800px) - minimal upscale
+        # Calculate just enough to reach ~850px
+        scale_factor = min(850 / current_max, 1.5)
+        print(f"  Light upscale {width}x{height} -> {scale_factor:.1f}x to maintain natural photo quality...")
+    
+    # Separate alpha channel if present
+    has_alpha = image_array.shape[2] == 4 if len(image_array.shape) == 3 else False
+    
+    if has_alpha:
+        rgb = image_array[:, :, :3]
+        alpha = image_array[:, :, 3]
+    else:
+        rgb = image_array
+        alpha = None
+    
+    # Convert RGB to BGR for Real-ESRGAN
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    
+    # Upscale with Real-ESRGAN
+    try:
+        upscaler = get_upscaler()
+        if upscaler is None:
+            print(f"  Real-ESRGAN not available, skipping upscale")
+            return image_array
+            
+        upscaled_bgr, _ = upscaler.enhance(bgr, outscale=scale_factor)
+        upscaled_rgb = cv2.cvtColor(upscaled_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Upscale alpha channel if present (use high-quality interpolation)
+        if has_alpha:
+            new_height, new_width = upscaled_rgb.shape[:2]
+            upscaled_alpha = cv2.resize(alpha, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+            result = np.dstack([upscaled_rgb, upscaled_alpha])
+        else:
+            result = upscaled_rgb
+        
+        final_height, final_width = result.shape[:2]
+        final_max = max(final_width, final_height)
+        print(f"  ✓ Upscaled to {final_width}x{final_height} (max: {final_max}px) - natural photo quality preserved")
+        
+        return result
+        
+    except Exception as e:
+        print(f"  Warning: Upscaling failed ({str(e)}), using original image")
+        return image_array
+
 def detect_background_color(image_array):
     """
     Detect if the image has a predominantly white or black background.
@@ -160,8 +274,8 @@ def process_image(input_path, output_path):
                 result_image = remove_background_color_based_enhanced(image_rgb, bg_color)
                 method_used = f"Enhanced color-based removal ({bg_color} background)"
         
-        # Add 40px margin to the top
-        pil_image = Image.fromarray(result_image, 'RGBA')
+        # Add 40px margin to the top first
+        pil_image = Image.fromarray(result_image)
         
         # Get original dimensions
         original_width, original_height = pil_image.size
@@ -171,10 +285,18 @@ def process_image(input_path, output_path):
         new_height = original_height + top_margin
         new_image = Image.new('RGBA', (original_width, new_height), (0, 0, 0, 0))
         
-        # Paste the original image with 40px offset from top
-        new_image.paste(pil_image, (0, top_margin))
+        # Paste the original image with 40px offset from top (using alpha channel as mask)
+        new_image.paste(pil_image, (0, top_margin), pil_image)
         
-        new_image.save(output_path, 'PNG', optimize=False, compress_level=1)
+        # Convert back to array for upscaling
+        final_image_array = np.array(new_image)
+        
+        # Upscale image intelligently if needed (after adding margin)
+        final_image_array = intelligent_upscale(final_image_array, max_dimension=1000)
+        
+        # Convert back to PIL and save
+        final_pil_image = Image.fromarray(final_image_array)
+        final_pil_image.save(output_path, 'PNG', optimize=False, compress_level=1)
         
         return True, method_used
         
@@ -244,12 +366,6 @@ def main():
         f.write("Enhanced Background Removal Results\n")
         f.write("=" * 40 + "\n")
         f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write("Features used:\n")
-        f.write("- AI-based background removal (rembg)\n")
-        f.write("- Enhanced color-based fallback method\n")
-        f.write("- Advanced edge smoothing and anti-aliasing\n")
-        f.write("- Multi-color space analysis (HSV + LAB)\n")
-        f.write("- Morphological operations for noise reduction\n\n")
         f.write(f"Total files processed: {processed_count}\n")
         f.write(f"Total files skipped: {skipped_count}\n\n")
         f.write("Detailed Results:\n")
@@ -263,12 +379,6 @@ def main():
     print(f"Successfully processed: {processed_count} images")
     print(f"Skipped: {skipped_count} images")
     print(f"Results saved to: output.txt")
-    print("\nThe new version provides:")
-    print("• AI-powered background removal for superior quality")
-    print("• Enhanced edge smoothing and anti-aliasing")
-    print("• Better color detection using multiple color spaces")
-    print("• Advanced morphological operations")
-    print("• Smooth gradients at object edges")
 
 if __name__ == "__main__":
     main()
